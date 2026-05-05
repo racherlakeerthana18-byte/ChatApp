@@ -1,0 +1,372 @@
+@page "/admin"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject IRoomService RoomService
+@inject IReportingService ReportingService
+@inject IModerationService ModerationService
+@inject AdminAccessService AdminAccessService
+@inject IChatEventFeed EventFeed
+
+<PageTitle>Moderator Console</PageTitle>
+
+@if (!AdminAccessService.IsAuthorized)
+{
+    <div class="page-grid admin-auth-grid">
+        <section class="panel">
+            <div class="eyebrow">Moderator console</div>
+            <h1>Passcode required</h1>
+            <p class="support-copy">Regular users stay anonymous. This dashboard is protected by an environment-configured admin passcode.</p>
+
+            @if (string.Equals(Error, "invalid", StringComparison.OrdinalIgnoreCase))
+            {
+                <div class="notice error-notice">That passcode did not match.</div>
+            }
+
+            <form method="post" action="/admin/auth" class="admin-form">
+                <input type="hidden" name="returnUrl" value="/admin" />
+                <label class="field">
+                    <span>Passcode</span>
+                    <input type="password" name="passcode" autocomplete="current-password" />
+                </label>
+                <button class="primary-button" type="submit">Open dashboard</button>
+            </form>
+        </section>
+    </div>
+}
+else
+{
+    <div class="page-grid admin-grid">
+        <section class="panel">
+            <div class="section-header">
+                <div>
+                    <div class="eyebrow">Moderator console</div>
+                    <h1>Live rooms and reports</h1>
+                </div>
+                <div class="action-row">
+                    <button class="ghost-button" type="button" @onclick="LoadDashboardAsync">Refresh</button>
+                    <form method="post" action="/admin/logout">
+                        <button class="secondary-button" type="submit">Sign out</button>
+                    </form>
+                </div>
+            </div>
+
+            @if (!string.IsNullOrWhiteSpace(_statusMessage))
+            {
+                <div class="notice success-notice">@_statusMessage</div>
+            }
+
+            @if (!string.IsNullOrWhiteSpace(_errorMessage))
+            {
+                <div class="notice error-notice">@_errorMessage</div>
+            }
+        </section>
+
+        <section class="panel">
+            <div class="section-title">Incoming reports</div>
+            @if (_reports.Count == 0)
+            {
+                <p class="support-copy">No reports right now.</p>
+            }
+            else
+            {
+                <div class="admin-list">
+                    @foreach (var report in _reports)
+                    {
+                        <button class="admin-list-item" type="button" @onclick="() => SelectRoomAsync(report.RoomId)">
+                            <strong>@report.RoomId</strong>
+                            <span>Message @report.MessageId</span>
+                            <span>@report.Reason</span>
+                            <span>@report.ReportedAtUtc.ToLocalTime().ToString("MMM d, HH:mm")</span>
+                        </button>
+                    }
+                </div>
+            }
+        </section>
+
+        <section class="panel">
+            <div class="section-title">Active rooms</div>
+            @if (_rooms.Count == 0)
+            {
+                <p class="support-copy">No active rooms found.</p>
+            }
+            else
+            {
+                <div class="admin-list">
+                    @foreach (var room in _rooms)
+                    {
+                        <button class="admin-list-item" type="button" @onclick="() => SelectRoomAsync(room.Id)">
+                            <strong>@room.Name</strong>
+                            <span>@room.Id</span>
+                            <span>@room.Visibility</span>
+                            <span>@room.ParticipantCount online</span>
+                        </button>
+                    }
+                </div>
+            }
+        </section>
+
+        <section class="panel admin-detail-panel">
+            <div class="section-header">
+                <div>
+                    <div class="section-title">Room detail</div>
+                    <p class="support-copy">Mute participants, remove messages, or close the room.</p>
+                </div>
+                @if (_selectedRoom is not null)
+                {
+                    <button class="secondary-button" type="button" @onclick="CloseSelectedRoomAsync">Close room</button>
+                }
+            </div>
+
+            @if (_selectedRoom is null)
+            {
+                <p class="support-copy">Pick a room to inspect its live participants and temporary history.</p>
+            }
+            else
+            {
+                <div class="admin-room-header">
+                    <h2>@_selectedRoom.Room.Name</h2>
+                    <div class="room-stats">
+                        <span class="room-chip">@_selectedRoom.Room.Id</span>
+                        <span class="room-chip">@_selectedRoom.Participants.Count online</span>
+                        @if (_selectedRoom.Room.IsClosed)
+                        {
+                            <span class="room-chip alert-chip">Closed</span>
+                        }
+                    </div>
+                </div>
+
+                <div class="admin-columns">
+                    <div>
+                        <div class="section-title">Participants</div>
+                        <div class="presence-list">
+                            @foreach (var participant in _selectedRoom.Participants)
+                            {
+                                <div class="presence-item admin-presence-item">
+                                    <div>
+                                        <strong>@participant.Nickname</strong>
+                                        <div class="support-copy">@participant.SessionId</div>
+                                    </div>
+                                    <button class="ghost-button compact-button" type="button" @onclick="() => MuteParticipantAsync(participant.SessionId)">
+                                        Mute
+                                    </button>
+                                </div>
+                            }
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="section-title">Recent messages</div>
+                        <div class="message-list">
+                            @foreach (var message in _selectedRoom.Messages)
+                            {
+                                <article class="message-card">
+                                    <div class="message-meta">
+                                        <strong>@message.Nickname</strong>
+                                        <span>@message.SentAtUtc.ToLocalTime().ToString("HH:mm")</span>
+                                    </div>
+                                    <p class="message-body">
+                                        @(message.IsRemoved ? "Removed by moderator." : message.Content)
+                                    </p>
+                                    @if (!message.IsRemoved)
+                                    {
+                                        <button class="ghost-button compact-button" type="button" @onclick="() => RemoveMessageAsync(message.Id)">
+                                            Remove
+                                        </button>
+                                    }
+                                </article>
+                            }
+                        </div>
+                    </div>
+                </div>
+            }
+        </section>
+
+        <section class="panel">
+            <div class="section-title">Recent moderation</div>
+            @if (_moderationActions.Count == 0)
+            {
+                <p class="support-copy">No moderation actions yet.</p>
+            }
+            else
+            {
+                <div class="admin-list">
+                    @foreach (var action in _moderationActions)
+                    {
+                        <div class="admin-list-item static-item">
+                            <strong>@action.ActionType</strong>
+                            <span>Room @action.RoomId</span>
+                            <span>@action.Reason</span>
+                            <span>@action.OccurredAtUtc.ToLocalTime().ToString("MMM d, HH:mm")</span>
+                        </div>
+                    }
+                </div>
+            }
+        </section>
+    </div>
+}
+
+@code {
+    [SupplyParameterFromQuery(Name = "error")]
+    public string? Error { get; set; }
+
+    private readonly List<ListedRoomSummary> _rooms = [];
+    private readonly List<ReportRecord> _reports = [];
+    private readonly List<ModerationAction> _moderationActions = [];
+    private IDisposable? _subscription;
+    private RoomStateSnapshot? _selectedRoom;
+    private string? _selectedRoomId;
+    private string? _statusMessage;
+    private string? _errorMessage;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _subscription = EventFeed.Subscribe(HandleChatEventAsync);
+        if (AdminAccessService.IsAuthorized)
+        {
+            await LoadDashboardAsync();
+        }
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (AdminAccessService.IsAuthorized && _rooms.Count == 0)
+        {
+            await LoadDashboardAsync();
+        }
+    }
+
+    private async Task LoadDashboardAsync()
+    {
+        if (!AdminAccessService.IsAuthorized)
+        {
+            return;
+        }
+
+        _statusMessage = null;
+        _errorMessage = null;
+
+        var rooms = await RoomService.GetActiveRoomSummariesAsync();
+        var reports = await ReportingService.GetReportsAsync();
+        var actions = await ModerationService.GetModerationHistoryAsync();
+
+        _rooms.Clear();
+        _rooms.AddRange(rooms);
+
+        _reports.Clear();
+        _reports.AddRange(reports);
+
+        _moderationActions.Clear();
+        _moderationActions.AddRange(actions);
+
+        _selectedRoomId ??= _rooms.FirstOrDefault()?.Id;
+        if (!string.IsNullOrWhiteSpace(_selectedRoomId))
+        {
+            _selectedRoom = await RoomService.GetRoomSnapshotAsync(_selectedRoomId, string.Empty);
+        }
+        else
+        {
+            _selectedRoom = null;
+        }
+    }
+
+    private async Task SelectRoomAsync(string roomId)
+    {
+        _selectedRoomId = roomId;
+        _selectedRoom = await RoomService.GetRoomSnapshotAsync(roomId, string.Empty);
+    }
+
+    private async Task MuteParticipantAsync(string sessionId)
+    {
+        if (_selectedRoom is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await ModerationService.MuteParticipantAsync(new MuteParticipantRequest(
+                _selectedRoom.Room.Id,
+                sessionId,
+                "admin",
+                "Muted from the admin dashboard."));
+
+            _statusMessage = "Participant muted.";
+            await LoadDashboardAsync();
+        }
+        catch (Exception exception)
+        {
+            _errorMessage = exception.Message;
+        }
+    }
+
+    private async Task RemoveMessageAsync(string messageId)
+    {
+        if (_selectedRoom is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await ModerationService.RemoveMessageAsync(new RemoveMessageRequest(
+                _selectedRoom.Room.Id,
+                messageId,
+                "admin",
+                "Removed from the admin dashboard."));
+
+            _statusMessage = "Message removed.";
+            await LoadDashboardAsync();
+        }
+        catch (Exception exception)
+        {
+            _errorMessage = exception.Message;
+        }
+    }
+
+    private async Task CloseSelectedRoomAsync()
+    {
+        if (_selectedRoom is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await ModerationService.CloseRoomAsync(new CloseRoomRequest(
+                _selectedRoom.Room.Id,
+                "admin",
+                "Closed from the admin dashboard."));
+
+            _statusMessage = "Room closed.";
+            await LoadDashboardAsync();
+        }
+        catch (Exception exception)
+        {
+            _errorMessage = exception.Message;
+        }
+    }
+
+    private Task HandleChatEventAsync(ChatEvent chatEvent)
+    {
+        if (!AdminAccessService.IsAuthorized)
+        {
+            return Task.CompletedTask;
+        }
+
+        if (chatEvent is not (ReportAcceptedEvent or ModerationUpdatedEvent or RoomCatalogueChangedEvent or MessageRemovedEvent or RoomClosedEvent or MessageReceivedEvent or PresenceUpdatedEvent))
+        {
+            return Task.CompletedTask;
+        }
+
+        return InvokeAsync(async () =>
+        {
+            await LoadDashboardAsync();
+            StateHasChanged();
+        });
+    }
+
+    public void Dispose()
+    {
+        _subscription?.Dispose();
+    }
+}

@@ -1,0 +1,421 @@
+@page "/rooms/{RoomId}"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@inject IRoomService RoomService
+@inject IMessageService MessageService
+@inject IPresenceService PresenceService
+@inject ITypingService TypingService
+@inject IReportingService ReportingService
+@inject ClientSessionContext SessionContext
+@inject NavigationManager NavigationManager
+@inject IChatEventFeed EventFeed
+
+<PageTitle>@($"Room {NormalizedRoomId}")</PageTitle>
+
+@if (_roomMissing)
+{
+    <div class="page-grid">
+        <section class="panel">
+            <div class="section-title">Room not found</div>
+            <p class="support-copy">That room may have expired or been closed.</p>
+            <button class="primary-button" type="button" @onclick="GoHome">Back home</button>
+        </section>
+    </div>
+}
+else if (_room is null)
+{
+    <div class="page-grid">
+        <section class="panel">
+            <p class="support-copy">Loading room...</p>
+        </section>
+    </div>
+}
+else
+{
+    <div class="page-grid room-grid">
+        <section class="panel room-summary">
+            <div class="eyebrow">Room @NormalizedRoomId</div>
+            <h1>@_room.Name</h1>
+            <p class="lede">Share this link to invite someone quickly: <code>@ShareUrl</code></p>
+
+            <div class="room-stats">
+                <span class="room-chip">@_participants.Count present</span>
+                <span class="room-chip">@(_room.Visibility == RoomVisibility.Listed ? "Listed" : "Private")</span>
+                @if (_room.IsClosed)
+                {
+                    <span class="room-chip alert-chip">Closed</span>
+                }
+            </div>
+
+            @if (!string.IsNullOrWhiteSpace(_statusMessage))
+            {
+                <div class="notice success-notice">@_statusMessage</div>
+            }
+
+            @if (!string.IsNullOrWhiteSpace(_errorMessage))
+            {
+                <div class="notice error-notice">@_errorMessage</div>
+            }
+
+            @if (_room.IsClosed)
+            {
+                <div class="notice error-notice">This room was closed by a moderator. You can still read the recent history until it expires.</div>
+            }
+
+            @if (_currentParticipant is null && !_room.IsClosed)
+            {
+                <div class="join-card">
+                    <label class="field">
+                        <span>Pick a nickname</span>
+                        <input @bind="_nickname" maxlength="24" placeholder="Anonymous Fox" />
+                    </label>
+                    <button class="primary-button" type="button" @onclick="JoinRoomAsync">Join room</button>
+                </div>
+            }
+            else if (_currentParticipant is not null)
+            {
+                <div class="join-card">
+                    <div class="support-copy">
+                        Chatting as <strong>@_currentParticipant.Nickname</strong>
+                        @if (_currentParticipant.IsMuted)
+                        {
+                            <span class="muted-label">Muted</span>
+                        }
+                    </div>
+                    <button class="ghost-button" type="button" @onclick="LeaveRoomAsync">Leave room</button>
+                </div>
+            }
+        </section>
+
+        <section class="panel chat-panel">
+            <div class="section-header">
+                <div>
+                    <div class="section-title">Conversation</div>
+                    <p class="support-copy">Only the latest temporary history is kept.</p>
+                </div>
+            </div>
+
+            <div class="message-list">
+                @if (_messages.Count == 0)
+                {
+                    <div class="empty-state">
+                        <strong>No messages yet.</strong>
+                        <span>Say hello to get the room started.</span>
+                    </div>
+                }
+                else
+                {
+                    @foreach (var message in _messages)
+                    {
+                        <article class="message-card">
+                            <div class="message-meta">
+                                <strong>@message.Nickname</strong>
+                                <span>@message.SentAtUtc.ToLocalTime().ToString("HH:mm")</span>
+                            </div>
+                            <p class="message-body">
+                                @(message.IsRemoved ? "This message was removed by a moderator." : message.Content)
+                            </p>
+                            @if (!message.IsRemoved && _currentParticipant is not null)
+                            {
+                                <button class="ghost-button compact-button" type="button" @onclick="() => ReportMessageAsync(message.Id)">
+                                    Report
+                                </button>
+                            }
+                        </article>
+                    }
+                }
+            </div>
+
+            @if (_typingIndicators.Count > 0 && !string.IsNullOrWhiteSpace(TypingSummary))
+            {
+                <div class="typing-strip">@TypingSummary</div>
+            }
+
+            @if (_currentParticipant is not null)
+            {
+                <div class="composer">
+                    <textarea
+                        class="composer-input"
+                        maxlength="500"
+                        value="@_messageText"
+                        @oninput="OnMessageInput"
+                        placeholder="Type a message..."></textarea>
+                    <div class="action-row">
+                        <span class="subtle-copy">@_messageText.Length/500 characters</span>
+                        <button class="primary-button" type="button" disabled="@(_room.IsClosed || _currentParticipant.IsMuted)" @onclick="SendMessageAsync">
+                            Send
+                        </button>
+                    </div>
+                </div>
+            }
+        </section>
+
+        <aside class="panel presence-panel">
+            <div class="section-title">People here</div>
+            <div class="presence-list">
+                @foreach (var participant in _participants)
+                {
+                    <div class="presence-item">
+                        <strong>@participant.Nickname</strong>
+                        @if (participant.IsMuted)
+                        {
+                            <span class="muted-label">Muted</span>
+                        }
+                    </div>
+                }
+            </div>
+        </aside>
+    </div>
+}
+
+@code {
+    [Parameter]
+    public string RoomId { get; set; } = string.Empty;
+
+    private readonly List<ChatMessage> _messages = [];
+    private readonly List<ParticipantSession> _participants = [];
+    private readonly List<TypingIndicator> _typingIndicators = [];
+    private IDisposable? _subscription;
+    private CancellationTokenSource? _heartbeatCts;
+    private ChatApp.Application.Contracts.Room? _room;
+    private ParticipantSession? _currentParticipant;
+    private string _nickname = string.Empty;
+    private string _messageText = string.Empty;
+    private string? _errorMessage;
+    private string? _statusMessage;
+    private bool _roomMissing;
+
+    private string NormalizedRoomId => RoomId.Trim().ToUpperInvariant();
+    private string ShareUrl => NavigationManager.ToAbsoluteUri($"/rooms/{NormalizedRoomId}").ToString();
+    private string TypingSummary
+    {
+        get
+        {
+            var names = _typingIndicators
+                .Where(indicator => indicator.SessionId != SessionContext.SessionId)
+                .Select(indicator => indicator.Nickname)
+                .Distinct()
+                .ToList();
+
+            return names.Count switch
+            {
+                0 => string.Empty,
+                1 => $"{names[0]} is typing...",
+                _ => $"{string.Join(", ", names)} are typing..."
+            };
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        _subscription = EventFeed.Subscribe(HandleChatEventAsync);
+        await LoadSnapshotAsync();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await LoadSnapshotAsync();
+    }
+
+    private async Task LoadSnapshotAsync()
+    {
+        _roomMissing = false;
+        var snapshot = await RoomService.GetRoomSnapshotAsync(NormalizedRoomId, SessionContext.SessionId);
+        if (snapshot is null)
+        {
+            _room = null;
+            _roomMissing = true;
+            StopHeartbeat();
+            return;
+        }
+
+        ApplySnapshot(snapshot);
+        if (_currentParticipant is not null)
+        {
+            StartHeartbeat();
+        }
+    }
+
+    private void ApplySnapshot(RoomStateSnapshot snapshot)
+    {
+        _room = snapshot.Room;
+        _currentParticipant = snapshot.CurrentParticipant;
+
+        _participants.Clear();
+        _participants.AddRange(snapshot.Participants);
+
+        _messages.Clear();
+        _messages.AddRange(snapshot.Messages);
+
+        _typingIndicators.Clear();
+        _typingIndicators.AddRange(snapshot.TypingIndicators);
+    }
+
+    private async Task JoinRoomAsync()
+    {
+        _errorMessage = null;
+        _statusMessage = null;
+
+        try
+        {
+            var snapshot = await RoomService.JoinRoomAsync(new JoinRoomRequest(
+                NormalizedRoomId,
+                _nickname,
+                SessionContext.SessionId,
+                SessionContext.IpAddress));
+
+            ApplySnapshot(snapshot);
+            _statusMessage = "You joined the room.";
+            StartHeartbeat();
+        }
+        catch (Exception exception)
+        {
+            _errorMessage = exception.Message;
+        }
+    }
+
+    private async Task LeaveRoomAsync()
+    {
+        await RoomService.LeaveRoomAsync(new LeaveRoomRequest(NormalizedRoomId, SessionContext.SessionId));
+        StopHeartbeat();
+        NavigationManager.NavigateTo("/");
+    }
+
+    private async Task SendMessageAsync()
+    {
+        _errorMessage = null;
+        _statusMessage = null;
+
+        try
+        {
+            await MessageService.SendMessageAsync(new SendMessageRequest(
+                NormalizedRoomId,
+                SessionContext.SessionId,
+                _messageText,
+                SessionContext.IpAddress));
+
+            _messageText = string.Empty;
+            await TypingService.SetTypingAsync(new SetTypingRequest(NormalizedRoomId, SessionContext.SessionId, false));
+        }
+        catch (Exception exception)
+        {
+            _errorMessage = exception.Message;
+        }
+    }
+
+    private async Task ReportMessageAsync(string messageId)
+    {
+        _errorMessage = null;
+        _statusMessage = null;
+
+        try
+        {
+            await ReportingService.ReportMessageAsync(new ReportMessageRequest(
+                NormalizedRoomId,
+                messageId,
+                SessionContext.SessionId,
+                "Reported from the room UI.",
+                SessionContext.IpAddress));
+
+            _statusMessage = "Report sent to moderators.";
+        }
+        catch (Exception exception)
+        {
+            _errorMessage = exception.Message;
+        }
+    }
+
+    private async Task OnMessageInput(ChangeEventArgs args)
+    {
+        _messageText = args.Value?.ToString() ?? string.Empty;
+        if (_currentParticipant is null)
+        {
+            return;
+        }
+
+        await TypingService.SetTypingAsync(new SetTypingRequest(
+            NormalizedRoomId,
+            SessionContext.SessionId,
+            !string.IsNullOrWhiteSpace(_messageText)));
+    }
+
+    private Task HandleChatEventAsync(ChatEvent chatEvent)
+    {
+        var shouldRefresh = chatEvent switch
+        {
+            MessageReceivedEvent messageReceived => string.Equals(messageReceived.Message.RoomId, NormalizedRoomId, StringComparison.OrdinalIgnoreCase),
+            MessageRemovedEvent messageRemoved => string.Equals(messageRemoved.RoomId, NormalizedRoomId, StringComparison.OrdinalIgnoreCase),
+            PresenceUpdatedEvent presenceUpdated => string.Equals(presenceUpdated.RoomId, NormalizedRoomId, StringComparison.OrdinalIgnoreCase),
+            TypingUpdatedEvent typingUpdated => string.Equals(typingUpdated.RoomId, NormalizedRoomId, StringComparison.OrdinalIgnoreCase),
+            RoomClosedEvent roomClosed => string.Equals(roomClosed.RoomId, NormalizedRoomId, StringComparison.OrdinalIgnoreCase),
+            RoomCatalogueChangedEvent roomCatalogueChanged => string.Equals(roomCatalogueChanged.Room.Id, NormalizedRoomId, StringComparison.OrdinalIgnoreCase),
+            _ => false
+        };
+
+        if (!shouldRefresh)
+        {
+            return Task.CompletedTask;
+        }
+
+        return InvokeAsync(async () =>
+        {
+            await LoadSnapshotAsync();
+            StateHasChanged();
+        });
+    }
+
+    private void StartHeartbeat()
+    {
+        if (_heartbeatCts is not null)
+        {
+            return;
+        }
+
+        _heartbeatCts = new CancellationTokenSource();
+        _ = RunHeartbeatAsync(_heartbeatCts.Token);
+    }
+
+    private async Task RunHeartbeatAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                await PresenceService.HeartbeatAsync(NormalizedRoomId, SessionContext.SessionId, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private void StopHeartbeat()
+    {
+        _heartbeatCts?.Cancel();
+        _heartbeatCts?.Dispose();
+        _heartbeatCts = null;
+    }
+
+    private void GoHome()
+    {
+        NavigationManager.NavigateTo("/");
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _subscription?.Dispose();
+        StopHeartbeat();
+
+        if (_currentParticipant is not null)
+        {
+            try
+            {
+                await RoomService.LeaveRoomAsync(new LeaveRoomRequest(NormalizedRoomId, SessionContext.SessionId));
+            }
+            catch
+            {
+            }
+        }
+    }
+}

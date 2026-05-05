@@ -1,0 +1,189 @@
+﻿@page "/"
+
+@rendermode InteractiveServer
+@implements IDisposable
+@inject IRoomService RoomService
+@inject NavigationManager NavigationManager
+@inject ClientSessionContext SessionContext
+@inject IChatEventFeed EventFeed
+
+<PageTitle>Anonymous Chat Rooms</PageTitle>
+
+<div class="page-grid">
+    <section class="panel hero-panel">
+        <div class="eyebrow">Temporary chat</div>
+        <h1>Spin up an anonymous room and let it disappear on its own.</h1>
+        <p class="lede">
+            No accounts, no permanent database, and no message history beyond the configured TTL.
+            Create a listed lobby or a private link-only room and start chatting right away.
+        </p>
+
+        @if (!string.IsNullOrWhiteSpace(_statusMessage))
+        {
+            <div class="notice success-notice">@_statusMessage</div>
+        }
+
+        @if (!string.IsNullOrWhiteSpace(_errorMessage))
+        {
+            <div class="notice error-notice">@_errorMessage</div>
+        }
+
+        <div class="form-grid">
+            <label class="field">
+                <span>Room name</span>
+                <input @bind="_roomName" maxlength="40" placeholder="Sprint room, study hall, game night..." />
+            </label>
+
+            <label class="field">
+                <span>Visibility</span>
+                <select @bind="_roomVisibility">
+                    <option value="@RoomVisibility.Listed">Listed room</option>
+                    <option value="@RoomVisibility.Private">Private room</option>
+                </select>
+            </label>
+        </div>
+
+        <div class="action-row">
+            <button class="primary-button" type="button" @onclick="CreateRoomAsync">Create room</button>
+            <span class="subtle-copy">Your anonymous session is already ready on this browser.</span>
+        </div>
+    </section>
+
+    <section class="panel join-panel">
+        <div class="section-title">Jump in by room code</div>
+        <p class="support-copy">Already got a link or invite code? Enter it here and join from the room screen.</p>
+        <div class="join-row">
+            <input @bind="_joinRoomCode" maxlength="12" placeholder="ABC123" />
+            <button class="secondary-button" type="button" @onclick="NavigateToRoom">Open room</button>
+        </div>
+    </section>
+
+    <section class="panel list-panel">
+        <div class="section-header">
+            <div>
+                <div class="section-title">Listed rooms</div>
+                <p class="support-copy">Open rooms update live as people join, leave, and chat.</p>
+            </div>
+            <button class="ghost-button" type="button" @onclick="LoadRoomsAsync">Refresh</button>
+        </div>
+
+        @if (_isLoading)
+        {
+            <p class="support-copy">Loading rooms...</p>
+        }
+        else if (_listedRooms.Count == 0)
+        {
+            <div class="empty-state">
+                <strong>No listed rooms yet.</strong>
+                <span>Create the first one or use a private room code.</span>
+            </div>
+        }
+        else
+        {
+            <div class="room-list">
+                @foreach (var room in _listedRooms)
+                {
+                    <button class="room-card" type="button" @onclick="() => OpenRoom(room.Id)">
+                        <div class="room-card-top">
+                            <strong>@room.Name</strong>
+                            <span class="room-chip">@room.ParticipantCount online</span>
+                        </div>
+                        <div class="room-card-meta">
+                            <span>Code: @room.Id</span>
+                            <span>Updated @room.LastActivityUtc.ToLocalTime().ToString("MMM d, HH:mm")</span>
+                        </div>
+                    </button>
+                }
+            </div>
+        }
+    </section>
+</div>
+
+@code {
+    private readonly List<ListedRoomSummary> _listedRooms = [];
+    private IDisposable? _subscription;
+    private string _roomName = string.Empty;
+    private RoomVisibility _roomVisibility = RoomVisibility.Listed;
+    private string _joinRoomCode = string.Empty;
+    private string? _errorMessage;
+    private string? _statusMessage;
+    private bool _isLoading;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _subscription = EventFeed.Subscribe(HandleChatEventAsync);
+        await LoadRoomsAsync();
+    }
+
+    private async Task CreateRoomAsync()
+    {
+        _errorMessage = null;
+        _statusMessage = null;
+
+        try
+        {
+            var room = await RoomService.CreateRoomAsync(new CreateRoomRequest(
+                _roomName,
+                _roomVisibility,
+                SessionContext.SessionId,
+                SessionContext.IpAddress));
+
+            NavigationManager.NavigateTo($"/rooms/{room.Id}");
+        }
+        catch (Exception exception)
+        {
+            _errorMessage = exception.Message;
+        }
+    }
+
+    private void NavigateToRoom()
+    {
+        if (string.IsNullOrWhiteSpace(_joinRoomCode))
+        {
+            _errorMessage = "Enter a room code first.";
+            return;
+        }
+
+        OpenRoom(_joinRoomCode.Trim().ToUpperInvariant());
+    }
+
+    private async Task LoadRoomsAsync()
+    {
+        _isLoading = true;
+
+        try
+        {
+            var rooms = await RoomService.GetListedRoomsAsync();
+            _listedRooms.Clear();
+            _listedRooms.AddRange(rooms);
+        }
+        finally
+        {
+            _isLoading = false;
+        }
+    }
+
+    private Task HandleChatEventAsync(ChatEvent chatEvent)
+    {
+        if (chatEvent is not (RoomCatalogueChangedEvent or PresenceUpdatedEvent or RoomClosedEvent or MessageReceivedEvent))
+        {
+            return Task.CompletedTask;
+        }
+
+        return InvokeAsync(async () =>
+        {
+            await LoadRoomsAsync();
+            StateHasChanged();
+        });
+    }
+
+    private void OpenRoom(string roomId)
+    {
+        NavigationManager.NavigateTo($"/rooms/{roomId}");
+    }
+
+    public void Dispose()
+    {
+        _subscription?.Dispose();
+    }
+}
